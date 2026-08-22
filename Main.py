@@ -29,8 +29,6 @@ try:
     SQLALCHEMY_AVAILABLE = True
 except ImportError:
     SQLALCHEMY_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.warning("⚠ SQLAlchemy not installed, using in-memory fallback")
 
 # Load environment variables
 load_dotenv()
@@ -581,18 +579,19 @@ async def get_agent_logs(limit: int = 50):
 
 @app.get("/api/v1/p2p/mesh-status")
 async def get_mesh_status():
-    """Get P2P mesh network status"""
-    active_peers = sum(1 for p in PEER_ROUTING_TABLE.values() 
-                      if (datetime.utcnow() - p["last_seen"]).seconds < 300)
+    """
+    Get P2P mesh network status
+    Returns: active_peers count, full peers dictionary, UDP port, and status
+    """
+    active_peers = len(PEER_ROUTING_TABLE)
     
     return {
-        "node_id": str(uuid.uuid4())[:16],
-        "listening_port": P2P_PORT,
-        "listener_running": UDP_LISTENER_RUNNING,
         "active_peers": active_peers,
-        "total_peers": len(PEER_ROUTING_TABLE),
-        "last_ping_timestamp": LAST_UDP_PING.isoformat(),
-        "peers": get_peers_from_db()[:10]
+        "peers": PEER_ROUTING_TABLE,
+        "udp_port": P2P_PORT,
+        "status": "ONLINE" if UDP_LISTENER_RUNNING else "OFFLINE",
+        "last_ping": LAST_UDP_PING.isoformat(),
+        "listener_running": UDP_LISTENER_RUNNING
     }
 
 
@@ -768,14 +767,36 @@ AURA1_DASHBOARD_HTML = """
             transform: translate(0, 0);
         }
 
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         .info-text {
             font-size: 9px;
             color: var(--primary-cyan);
             margin-bottom: 6px;
-            padding: 4px;
+            padding: 6px;
             background: rgba(0, 240, 255, 0.05);
             border-left: 2px solid var(--primary-purple);
             border-radius: 2px;
+        }
+
+        .p2p-status {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px;
+            background: rgba(0, 240, 255, 0.05);
+            border-radius: 4px;
+            margin-bottom: 8px;
+            font-size: 10px;
+        }
+
+        .p2p-count {
+            font-size: 16px;
+            color: var(--primary-purple);
+            font-weight: bold;
         }
 
         .peers-list {
@@ -885,17 +906,21 @@ AURA1_DASHBOARD_HTML = """
             <div id="voiceTranscript" class="info-text">Ready for voice input...</div>
         </div>
 
-        <!-- P2P Mesh Network Panel -->
+        <!-- P2P Mesh Status Panel -->
         <div class="panel" style="grid-column: 2;">
             <h2>◈ P2P DHT Mesh Network</h2>
-            <button class="btn" onclick="broadcastDiscoveryPing()">🔊 Broadcast Discovery Ping</button>
-            <div class="info-text" id="meshInfo">Initializing mesh discovery...</div>
+            <div class="p2p-status">
+                <div>Active Peers:</div>
+                <div class="p2p-count" id="activePeersCount">0</div>
+            </div>
+            <button class="btn" onclick="refreshMeshStatus()">🔄 Refresh Status</button>
+            <button class="btn" onclick="broadcastDiscoveryPing()">🔊 Broadcast Ping</button>
             <div class="peers-list" id="peersList">
                 <div class="peer-item">Scanning for peers...</div>
             </div>
         </div>
 
-        <!-- Neural Sub-Systems Panel -->
+        <!-- Resiliency Panel -->
         <div class="panel" style="grid-column: 3; grid-row: 2; order: -1;">
             <h2>⚡ Resiliency & Cache</h2>
             <div class="info-text">
@@ -945,6 +970,18 @@ AURA1_DASHBOARD_HTML = """
             }
         }
 
+        async function refreshMeshStatus() {
+            try {
+                const btn = event.target;
+                btn.disabled = true;
+                await pollMeshStatus();
+                setTimeout(() => { btn.disabled = false; }, 500);
+            } catch (error) {
+                console.error('Error:', error);
+                event.target.disabled = false;
+            }
+        }
+
         async function broadcastDiscoveryPing() {
             try {
                 const btn = event.target;
@@ -989,20 +1026,22 @@ AURA1_DASHBOARD_HTML = """
                 const response = await fetch(`${API_BASE}/p2p/mesh-status`);
                 const mesh = await response.json();
                 
-                document.getElementById('stat-peers').textContent = mesh.active_peers;
-                document.getElementById('stat-port').textContent = mesh.listening_port;
-                document.getElementById('meshInfo').innerHTML = 
-                    `<strong>Port:</strong> ${mesh.listening_port}<br>` +
-                    `<strong>Active Peers:</strong> ${mesh.active_peers}/${mesh.total_peers}<br>` +
-                    `<strong>Listener:</strong> ${mesh.listener_running ? 'ACTIVE' : 'IDLE'}`;
+                const activePeers = mesh.active_peers;
+                document.getElementById('stat-peers').textContent = activePeers;
+                document.getElementById('activePeersCount').textContent = activePeers;
+                document.getElementById('stat-port').textContent = mesh.udp_port;
                 
                 let peersHTML = '';
-                mesh.peers.forEach(peer => {
-                    peersHTML += `<div class="peer-item">
-                        ${peer.id.substring(0, 8)} @ ${peer.ip}:${peer.port} (${peer.latency.toFixed(1)}ms)
-                    </div>`;
-                });
-                document.getElementById('peersList').innerHTML = peersHTML || '<div class="peer-item">No peers discovered yet</div>';
+                if (Object.keys(mesh.peers).length > 0) {
+                    Object.entries(mesh.peers).forEach(([peerId, peerData]) => {
+                        peersHTML += `<div class="peer-item">
+                            ${peerId.substring(0, 12)} @ ${peerData.ip}:${peerData.port} (${peerData.latency.toFixed(1)}ms)
+                        </div>`;
+                    });
+                } else {
+                    peersHTML = '<div class="peer-item">No peers discovered yet</div>';
+                }
+                document.getElementById('peersList').innerHTML = peersHTML;
             } catch (error) {
                 console.error('Mesh error:', error);
             }
